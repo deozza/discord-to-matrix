@@ -9,4 +9,4 @@ services:
       - /path/to/discordchatexporter/folder:/var/www/html/discord
       - ./php.ini:/usr/local/etc/php/php.ini
     working_dir: /var/www/html
-    command: php -f index.php
+    command: composer install; php -f index.php
