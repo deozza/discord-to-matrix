@@ -1,12 +1,12 @@
 services:
   discord-to-matrix:
     container_name: discord-to-matrix
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: golang:latest
     volumes:
-      - ./app:/var/www/html
-      - /path/to/discordchatexporter/folder:/var/www/html/discord
-      - ./php.ini:/usr/local/etc/php/php.ini
-    working_dir: /var/www/html
-    command: composer install; php -f index.php
+      - ./app:/go/src
+    tty: true
+    environment:
+      DISCORD_BACKUP_DIR: ${DISCORD_BACKUP_DIR}
+      MATRIX_SERVER_ADDRESS: ${MATRIX_SERVER_ADDRESS}
+      MATRIX_USERNAME: ${MATRIX_USERNAME}
+      MATRIX_PASSWORD: ${MATRIX_PASSWORD}
