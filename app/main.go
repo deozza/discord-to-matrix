@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,6 +112,16 @@ type createRoomPayload struct {
 
 type getRoomIdResponse struct {
 	RoomId    string `json:"room_id"`
+	Error     string `json:"error"`
+	ErrorCode string `json:"errcode"`
+}
+
+type addChildSpaceToParentPayload struct {
+	Via       []string `json:"via"`
+	Suggested bool     `json:"sugggested"`
+}
+
+type addChildSpaceToParentResponse struct {
 	Error     string `json:"error"`
 	ErrorCode string `json:"errcode"`
 }
@@ -236,21 +247,24 @@ func getNormalizedRoomName(category string) (normalized string) {
 }
 
 func prepareStructureOnServer(structure roomRelations) {
-	structure.Guild = client.prepareRoomOnServer(structure.Guild)
+	structure.Guild = client.prepareRoomOnServer(structure.Guild, true)
 
-	structure.Space = client.prepareRoomOnServer(structure.Space)
-	client.addChildSpaceToParent(structure.Guild, structure.Space)
+	structure.Space = client.prepareRoomOnServer(structure.Space, true)
 
-	structure.Room = client.prepareRoomOnServer(structure.Room)
-	client.addChildSpaceToParent(structure.Space, structure.Room)
-}
-
-func (c *apiClient) prepareRoomOnServer(room roomStructure) roomStructure {
-	getRoomIdResponse, err := client.getRoomId(room.AliasName)
-
+	err := client.addChildSpaceToParent(structure.Guild, structure.Space)
 	if err != nil {
 		panic(err)
 	}
+
+	structure.Room = client.prepareRoomOnServer(structure.Room, false)
+	err = client.addChildSpaceToParent(structure.Space, structure.Room)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (c *apiClient) prepareRoomOnServer(room roomStructure, isASpace bool) roomStructure {
+	getRoomIdResponse, err := client.getRoomId(room.AliasName)
 
 	if getRoomIdResponse != nil {
 		room.RoomId = getRoomIdResponse.RoomId
@@ -258,22 +272,22 @@ func (c *apiClient) prepareRoomOnServer(room roomStructure) roomStructure {
 		return room
 	}
 
-	// createRoomResponse, err := client.createRoom(room.Name, room.AliasName)
+	createRoomResponse, err := client.createRoom(room.Name, room.AliasName, isASpace)
 	if err != nil {
 		panic(err)
 	}
 
-	// room.RoomId = createRoomResponse.RoomId
+	room.RoomId = createRoomResponse.RoomId
 
 	return room
 }
 
 func (c *apiClient) getRoomId(aliasName string) (*getRoomIdResponse, error) {
 	logger.Info(fmt.Sprintf("Checking if room %s already exists", aliasName))
-	uri := fmt.Sprintf("/_matrix/client/v3/directory/room/#%s:%s", aliasName, os.Getenv(MATRIX_SERVER_ADDRESS))
-	logger.Info(fmt.Sprintf("%s%s", c.BaseURL, uri))
 
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s%s", c.BaseURL, uri), nil)
+	endpoint := "/_matrix/client/v3/directory/room/"
+	queryParameter := url.QueryEscape(fmt.Sprintf("#%s:%s", aliasName, os.Getenv(MATRIX_SERVER_ADDRESS)))
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s%s%s", c.BaseURL, endpoint, queryParameter), nil)
 
 	if err != nil {
 		logger.Error(err.Error())
@@ -283,14 +297,7 @@ func (c *apiClient) getRoomId(aliasName string) (*getRoomIdResponse, error) {
 	req.Header.Add("Content-Type", "application/json")
 
 	res, err := c.HTTPClient.Do(req)
-	if err != nil {
-		logger.Error(err.Error())
-		return nil, err
-	}
-
 	defer res.Body.Close()
-
-	getRoomIdResponse := getRoomIdResponse{}
 
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
@@ -298,33 +305,37 @@ func (c *apiClient) getRoomId(aliasName string) (*getRoomIdResponse, error) {
 		return nil, err
 	}
 
+	getRoomIdResponse := getRoomIdResponse{}
+
 	if err = json.Unmarshal(body, &getRoomIdResponse); err != nil {
 		logger.Error(err.Error())
 		return nil, err
 	}
 
-	if res.StatusCode != 200 && getRoomIdResponse.ErrorCode != "M_NOT_FOUND" {
-		logger.Info(req.URL.Path)
-		logger.Info(req.URL.String())
-		logger.Info(res.Status)
+	if res.StatusCode != 200 {
 		logger.Info(fmt.Sprintf("Room %s does not exist", aliasName))
 		return nil, errors.New(getRoomIdResponse.Error)
 	}
 
-	logger.Info(fmt.Sprintf("Room %s already exist with id %s", getRoomIdResponse.RoomId))
+	logger.Info(fmt.Sprintf("Room %s already exist with id %s", aliasName, getRoomIdResponse.RoomId))
 
 	createdRooms = append(createdRooms, aliasName)
 
 	return &getRoomIdResponse, nil
 }
 
-func (c *apiClient) createRoom(name string, aliasName string) (*createRoomResponse, error) {
+func (c *apiClient) createRoom(name string, aliasName string, isASpace bool) (*createRoomResponse, error) {
 	logger.Info(fmt.Sprintf("Creating room %s", aliasName))
+
+	roomType := ""
+	if isASpace == true {
+		roomType = "m.space"
+	}
 
 	payload := createRoomPayload{
 		CreationContent: creationContent{
 			MFederate: false,
-			Type:      "m.space",
+			Type:      roomType,
 		},
 		Name:          name,
 		Preset:        "private_chat",
@@ -344,12 +355,11 @@ func (c *apiClient) createRoom(name string, aliasName string) (*createRoomRespon
 	req.Header.Add("Authorization", "Bearer "+c.Token)
 
 	res, err := c.HTTPClient.Do(req)
+	defer res.Body.Close()
 	if err != nil {
 		logger.Error(err.Error())
 		return nil, err
 	}
-
-	defer res.Body.Close()
 
 	createRoomResponse := createRoomResponse{}
 
@@ -373,9 +383,56 @@ func (c *apiClient) createRoom(name string, aliasName string) (*createRoomRespon
 	return &createRoomResponse, nil
 }
 
-func (c *apiClient) addChildSpaceToParent(parentRoom roomStructure, childRoom roomStructure) {
+func (c *apiClient) addChildSpaceToParent(parentRoom roomStructure, childRoom roomStructure) error {
 	logger.Info(fmt.Sprintf("Linking parent room %s to %s", parentRoom.Name, childRoom.Name))
 
+	payload := addChildSpaceToParentPayload{
+		Via:       []string{os.Getenv(MATRIX_SERVER_ADDRESS)},
+		Suggested: true,
+	}
+
+	jsonData, err := json.Marshal(payload)
+
+	url := fmt.Sprintf("%s%s%s%s%s", c.BaseURL, "/_matrix/client/v3/rooms/", url.QueryEscape(parentRoom.RoomId), "/state/m.space.child/", url.QueryEscape(childRoom.RoomId))
+
+	fmt.Println(url)
+
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewBuffer(jsonData))
+
+	if err != nil {
+		logger.Error(err.Error())
+		return err
+	}
+
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Authorization", "Bearer "+c.Token)
+
+	res, err := c.HTTPClient.Do(req)
+	defer res.Body.Close()
+	if err != nil {
+		logger.Error(err.Error())
+		return err
+	}
+
+	addaddChildSpaceToParentResponse := addChildSpaceToParentResponse{}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		logger.Error(err.Error())
+		return err
+	}
+
+	if err = json.Unmarshal(body, &addaddChildSpaceToParentResponse); err != nil {
+		logger.Error(err.Error())
+		return err
+	}
+	if res.StatusCode != 200 {
+		return errors.New(addaddChildSpaceToParentResponse.Error)
+	}
+
+	logger.Info("Rooms are linked")
+
+	return nil
 }
 
 func (c *apiClient) postMessages(roomName string, messages []message) {
