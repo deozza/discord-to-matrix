@@ -18,6 +18,7 @@ type channel struct {
 	Category string `json:"category"`
 	Name     string `json:"name"`
 	Type     string `json:"type"`
+	Topic    string `json:"topic"`
 }
 
 type guild struct {
@@ -59,6 +60,7 @@ type roomStructure struct {
 	Name      string
 	AliasName string
 	RoomId    string
+	Topic     string
 }
 
 type roomRelations struct {
@@ -89,10 +91,13 @@ type loginPayload struct {
 }
 
 type createRoomResponse struct {
+	RoomId    string `json:"room_id"`
+	Error     string `json:"error"`
+	ErrorCode string `json:"errcode"`
 }
 
 type creationContent struct {
-	MFederate string `json:"m.federate"`
+	MFederate bool   `json:"m.federate"`
 	Type      string `json:"type"`
 }
 
@@ -101,11 +106,19 @@ type createRoomPayload struct {
 	Name            string          `json:"name"`
 	Preset          string          `json:"preset"`
 	RoomAliasName   string          `json:"room_alias_name"`
+	Topic           string          `json:"topic"`
+}
+
+type getRoomIdResponse struct {
+	RoomId    string `json:"room_id"`
+	Error     string `json:"error"`
+	ErrorCode string `json:"errcode"`
 }
 
 const (
 	DISCORD_BACKUP_DIR    = "DISCORD_BACKUP_DIR"
 	MATRIX_SERVER_ADDRESS = "MATRIX_SERVER_ADDRESS"
+	MATRIX_TOKEN          = "MATRIX_TOKEN"
 	MATRIX_USERNAME       = "MATRIX_USERNAME"
 	MATRIX_PASSWORD       = "MATRIX_PASSWORD"
 )
@@ -120,29 +133,41 @@ func main() {
 		logger.Error(err.Error())
 	}
 
-	loginResponse, err := client.getMatrixAuthToken()
+	client.Token = os.Getenv(MATRIX_TOKEN)
 
-	if err != nil {
-		logger.Error(err.Error())
+	if client.Token == "" {
+		loginResponse, err := client.getMatrixAuthToken()
+
+		if err != nil {
+			logger.Error(err.Error())
+		}
+
+		client.Token = loginResponse.AccessToken
+		logger.Info("Authenticated with provided username and password")
+	} else {
+		logger.Info("Authenticated with provided token")
 	}
-
-	client.Token = loginResponse.AccessToken
-
-	logger.Info(client.Token)
 
 	files := getFilesFromBackupDir()
 
 	for _, file := range files {
-		fileHandler(file)
+		_, structure := fileHandler(file)
+		prepareStructureOnServer(structure)
 	}
 }
 
 func checkEnv() error {
-	var envs = [4]string{DISCORD_BACKUP_DIR, MATRIX_SERVER_ADDRESS, MATRIX_USERNAME, MATRIX_PASSWORD}
+	var envs = [2]string{DISCORD_BACKUP_DIR, MATRIX_SERVER_ADDRESS}
 	for _, env := range envs {
 
 		if os.Getenv(env) == "" {
 			return errors.New(fmt.Sprintf("Missing env %s. Your docker-compose.yaml file must contains the following environment variable %s", env, envs))
+		}
+	}
+
+	if os.Getenv(MATRIX_TOKEN) == "" {
+		if os.Getenv(MATRIX_USERNAME) == "" && os.Getenv(MATRIX_PASSWORD) == "" {
+			return errors.New("You must provide either a valid matrix token or your credentials to login to your server.")
 		}
 	}
 
@@ -176,15 +201,15 @@ func getDecodedFileContent(filePath string) (decodedFileContent channelContent) 
 	return
 }
 
-func fileHandler(file string) {
+func fileHandler(file string) (fileContent channelContent, structure roomRelations) {
 	logger.Info(fmt.Sprintf("Working on file %s", file))
-	fileContent := getDecodedFileContent(file)
+	fileContent = getDecodedFileContent(file)
 
 	if fileContent.Channel.Type != "GuildTextChat" {
 		return
 	}
 
-	structure := roomRelations{
+	structure = roomRelations{
 		Guild: roomStructure{
 			Name:      fileContent.Guild.Name,
 			AliasName: getNormalizedRoomName(fileContent.Guild.Name),
@@ -199,10 +224,7 @@ func fileHandler(file string) {
 		},
 	}
 
-	prepareStructureOnServer(structure)
-
-	// postMessages(roomName, fileContent.Messages)
-
+	return
 }
 
 func getNormalizedRoomName(category string) (normalized string) {
@@ -214,21 +236,141 @@ func getNormalizedRoomName(category string) (normalized string) {
 }
 
 func prepareStructureOnServer(structure roomRelations) {
-	structure.Guild.RoomId = client.createRoom(structure.Guild.Name, structure.Guild.AliasName)
+	structure.Guild = client.prepareRoomOnServer(structure.Guild)
 
-	structure.Space.RoomId = client.createRoom(structure.Space.Name, structure.Space.AliasName)
+	structure.Space = client.prepareRoomOnServer(structure.Space)
 	client.addChildSpaceToParent(structure.Guild, structure.Space)
 
-	structure.Room.RoomId = client.createRoom(structure.Room.Name, structure.Room.AliasName)
+	structure.Room = client.prepareRoomOnServer(structure.Room)
 	client.addChildSpaceToParent(structure.Space, structure.Room)
 }
 
-func (c *apiClient) createRoom(name string, aliasName string) string {
-	logger.Info(fmt.Sprintf("Creating room %s", name))
+func (c *apiClient) prepareRoomOnServer(room roomStructure) roomStructure {
+	getRoomIdResponse, err := client.getRoomId(room.AliasName)
+
+	if err != nil {
+		panic(err)
+	}
+
+	if getRoomIdResponse != nil {
+		room.RoomId = getRoomIdResponse.RoomId
+
+		return room
+	}
+
+	// createRoomResponse, err := client.createRoom(room.Name, room.AliasName)
+	if err != nil {
+		panic(err)
+	}
+
+	// room.RoomId = createRoomResponse.RoomId
+
+	return room
+}
+
+func (c *apiClient) getRoomId(aliasName string) (*getRoomIdResponse, error) {
+	logger.Info(fmt.Sprintf("Checking if room %s already exists", aliasName))
+	uri := fmt.Sprintf("/_matrix/client/v3/directory/room/#%s:%s", aliasName, os.Getenv(MATRIX_SERVER_ADDRESS))
+	logger.Info(fmt.Sprintf("%s%s", c.BaseURL, uri))
+
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s%s", c.BaseURL, uri), nil)
+
+	if err != nil {
+		logger.Error(err.Error())
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", "application/json")
+
+	res, err := c.HTTPClient.Do(req)
+	if err != nil {
+		logger.Error(err.Error())
+		return nil, err
+	}
+
+	defer res.Body.Close()
+
+	getRoomIdResponse := getRoomIdResponse{}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		logger.Error(err.Error())
+		return nil, err
+	}
+
+	if err = json.Unmarshal(body, &getRoomIdResponse); err != nil {
+		logger.Error(err.Error())
+		return nil, err
+	}
+
+	if res.StatusCode != 200 && getRoomIdResponse.ErrorCode != "M_NOT_FOUND" {
+		logger.Info(req.URL.Path)
+		logger.Info(req.URL.String())
+		logger.Info(res.Status)
+		logger.Info(fmt.Sprintf("Room %s does not exist", aliasName))
+		return nil, errors.New(getRoomIdResponse.Error)
+	}
+
+	logger.Info(fmt.Sprintf("Room %s already exist with id %s", getRoomIdResponse.RoomId))
 
 	createdRooms = append(createdRooms, aliasName)
 
-	return "roomId"
+	return &getRoomIdResponse, nil
+}
+
+func (c *apiClient) createRoom(name string, aliasName string) (*createRoomResponse, error) {
+	logger.Info(fmt.Sprintf("Creating room %s", aliasName))
+
+	payload := createRoomPayload{
+		CreationContent: creationContent{
+			MFederate: false,
+			Type:      "m.space",
+		},
+		Name:          name,
+		Preset:        "private_chat",
+		RoomAliasName: aliasName,
+	}
+
+	jsonData, err := json.Marshal(payload)
+
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s%s", c.BaseURL, "/_matrix/client/v3/createRoom"), bytes.NewBuffer(jsonData))
+
+	if err != nil {
+		logger.Error(err.Error())
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Authorization", "Bearer "+c.Token)
+
+	res, err := c.HTTPClient.Do(req)
+	if err != nil {
+		logger.Error(err.Error())
+		return nil, err
+	}
+
+	defer res.Body.Close()
+
+	createRoomResponse := createRoomResponse{}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		logger.Error(err.Error())
+		return nil, err
+	}
+
+	if err = json.Unmarshal(body, &createRoomResponse); err != nil {
+		logger.Error(err.Error())
+		return nil, err
+	}
+	if res.StatusCode != 200 {
+		return nil, errors.New(createRoomResponse.Error)
+	}
+
+	logger.Info(fmt.Sprintf("Room %s created with id %s", aliasName, createRoomResponse.RoomId))
+	createdRooms = append(createdRooms, aliasName)
+
+	return &createRoomResponse, nil
 }
 
 func (c *apiClient) addChildSpaceToParent(parentRoom roomStructure, childRoom roomStructure) {
@@ -241,7 +383,7 @@ func (c *apiClient) postMessages(roomName string, messages []message) {
 
 func getApiClient() *apiClient {
 	return &apiClient{
-		BaseURL:    os.Getenv(MATRIX_SERVER_ADDRESS),
+		BaseURL:    "https://" + os.Getenv(MATRIX_SERVER_ADDRESS),
 		HTTPClient: &http.Client{Timeout: 5 * time.Second},
 	}
 }
