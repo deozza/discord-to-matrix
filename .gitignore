@@ -1,2 +1,4 @@
 /app/vendor
 /.env
+/app/discord
+/app/pkg

@@ -1,24 +1,26 @@
 # Discord to Matrix
 
-- cloner le repository
+- clone the repository
 
 ```bash
 git clone https://forgejo.letsjam.dev/letsjam/discord-to-matrix
 cd discord-to-matrix
 ```
-- faire un backup avec [discordchatexporter](https://github.com/tyrrrz/discordchatexporter)
+- run a discord backup with [discordchatexporter](https://github.com/tyrrrz/discordchatexporter)
 
 ```bash
-docker run --rm -v ./discord:/out tyrrrz/discordchatexporter:stable exportguild -t <token_discord> -f json -g <id_guilde> --parallel <nombre_chans_a_traiter_en_meme_temps> --media true --reuse-media true --include-vc false --after <date_min_messages>
+docker run --rm -v ./discord:/out tyrrrz/discordchatexporter:stable exportguild -t <token_discord> -f json -g <id_guilde> --parallel <number_of_chans_to_process_in_parallels> --media true --reuse-media true --include-vc false --after <date_min_messages>
 ```
 
-- configurer dans le fichier `index.php` :
-  - l'adresse du serveur matrix cible
-  - le login d'un compte matrix sur ce serveur
-  - le mot de passe de ce compte
-
-- lancer le projet
+- build the env and install the dependencies
 
 ```bash
-docker compose up
+docker compose up -d --build
+docker compose exec discord-to-matrix go mod tidy
+```
+
+- run the script
+
+```bash
+docker compose exec discord-to-matrix go run main.go
 ```
