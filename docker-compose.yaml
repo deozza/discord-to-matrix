@@ -3,7 +3,7 @@ services:
     container_name: discord-to-matrix
     image: golang:latest
     volumes:
-      - ./app:/go/src
+      - ./app:/go
     tty: true
     environment:
       DISCORD_BACKUP_DIR: ${DISCORD_BACKUP_DIR}
@@ -11,3 +11,4 @@ services:
       MATRIX_TOKEN: ${MATRIX_TOKEN}
       MATRIX_USERNAME: ${MATRIX_USERNAME}
       MATRIX_PASSWORD: ${MATRIX_PASSWORD}
+    working_dir: /go

@@ -5,6 +5,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"github.com/gabriel-vasile/mimetype"
 	"io"
 	"log/slog"
 	"net/http"
@@ -126,6 +127,44 @@ type addChildSpaceToParentResponse struct {
 	ErrorCode string `json:"errcode"`
 }
 
+type textMessagePayload struct {
+	Body        string `json:"body"`
+	MessageType string `json:"msgtype"`
+}
+
+type textMessageResponse struct {
+	Error     string `json:"error"`
+	ErrorCode string `json:"errcode"`
+}
+
+type fileInfos struct {
+	Mimetype string `json:"mimetype"`
+	Size     int64  `json:"size"`
+}
+
+type fileMessagePayload struct {
+	Body        string    `json:"body"`
+	Url         string    `json:"url"`
+	Info        fileInfos `json:"info"`
+	MessageType string    `json:"msgtype"`
+}
+
+type fileMessageResponse struct {
+	Error     string `json:"error"`
+	ErrorCode string `json:"errcode"`
+}
+
+type localFileInfos struct {
+	Mimetype string
+	Size     int64
+	FileName string
+	FilePath string
+}
+
+type uploadFileResponse struct {
+	ContentUri string `json:"content_uri"`
+}
+
 const (
 	DISCORD_BACKUP_DIR    = "DISCORD_BACKUP_DIR"
 	MATRIX_SERVER_ADDRESS = "MATRIX_SERVER_ADDRESS"
@@ -162,8 +201,9 @@ func main() {
 	files := getFilesFromBackupDir()
 
 	for _, file := range files {
-		_, structure := fileHandler(file)
-		prepareStructureOnServer(structure)
+		fileContent, structure := fileHandler(file)
+		structure = prepareStructureOnServer(structure)
+		postMessages(structure.Room, fileContent.Messages)
 	}
 }
 
@@ -246,7 +286,7 @@ func getNormalizedRoomName(category string) (normalized string) {
 	return strings.ToLower(normalized)
 }
 
-func prepareStructureOnServer(structure roomRelations) {
+func prepareStructureOnServer(structure roomRelations) roomRelations {
 	structure.Guild = client.prepareRoomOnServer(structure.Guild, true)
 
 	structure.Space = client.prepareRoomOnServer(structure.Space, true)
@@ -261,6 +301,8 @@ func prepareStructureOnServer(structure roomRelations) {
 	if err != nil {
 		panic(err)
 	}
+
+	return structure
 }
 
 func (c *apiClient) prepareRoomOnServer(room roomStructure, isASpace bool) roomStructure {
@@ -395,8 +437,6 @@ func (c *apiClient) addChildSpaceToParent(parentRoom roomStructure, childRoom ro
 
 	url := fmt.Sprintf("%s%s%s%s%s", c.BaseURL, "/_matrix/client/v3/rooms/", url.QueryEscape(parentRoom.RoomId), "/state/m.space.child/", url.QueryEscape(childRoom.RoomId))
 
-	fmt.Println(url)
-
 	req, err := http.NewRequest(http.MethodPut, url, bytes.NewBuffer(jsonData))
 
 	if err != nil {
@@ -435,7 +475,17 @@ func (c *apiClient) addChildSpaceToParent(parentRoom roomStructure, childRoom ro
 	return nil
 }
 
-func (c *apiClient) postMessages(roomName string, messages []message) {
+func postMessages(room roomStructure, messages []message) {
+	for _, message := range messages {
+		client.postTextMessage(room, message)
+
+		for _, sticker := range message.Stickers {
+			postStickerMessage(room, message, sticker)
+		}
+		for _, attachment := range message.Attachments {
+			postAttachmentMessage(room, message, attachment)
+		}
+	}
 }
 
 func getApiClient() *apiClient {
@@ -490,30 +540,214 @@ func (c *apiClient) getMatrixAuthToken() (*loginResponse, error) {
 	return &loginResponse, nil
 }
 
-func postTextMessage() {
+func (c *apiClient) postTextMessage(room roomStructure, message message) (err error) {
+	contentTemplate := "[%s][%s][%s] : %s"
+	postedTime := message.Timestamp
+
+	if message.TimestampEdited != "" {
+		postedTime = message.TimestampEdited
+	}
+
+	content := fmt.Sprintf(contentTemplate, postedTime, message.Author.Name, message.Author.Nickname, message.Content)
+
+	payload := textMessagePayload{
+		Body:        content,
+		MessageType: "m.text",
+	}
+
+	jsonData, err := json.Marshal(payload)
+
+	url := fmt.Sprintf("%s%s%s%s", c.BaseURL, "/_matrix/client/v3/rooms/", url.QueryEscape(room.RoomId), "/state/m.room.message")
+
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewBuffer(jsonData))
+
+	if err != nil {
+		logger.Error(err.Error())
+		return err
+	}
+
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Authorization", "Bearer "+c.Token)
+
+	res, err := c.HTTPClient.Do(req)
+	defer res.Body.Close()
+	if err != nil {
+		logger.Error(err.Error())
+		return err
+	}
+
+	textMessageResponse := textMessageResponse{}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		logger.Error(err.Error())
+		return err
+	}
+
+	if err = json.Unmarshal(body, &textMessageResponse); err != nil {
+		logger.Error(err.Error())
+		return err
+	}
+	if res.StatusCode != 200 {
+		return errors.New(textMessageResponse.Error)
+	}
+
+	return
+}
+
+func postStickerMessage(room roomStructure, message message, sticker sticker) error {
+	fileInfos, err := getFileInfos(sticker.SourceUrl)
+	if err != nil {
+		return err
+	}
+
+	uploadFileResponse, err := client.uploadFile(room, fileInfos)
+	if err != nil {
+		return err
+	}
+
+	return client.postFileMessage(room, fileInfos, uploadFileResponse.ContentUri)
+}
+
+func postAttachmentMessage(room roomStructure, message message, attachment attachment) error {
+	fileInfos, err := getFileInfos(attachment.Url)
+	if err != nil {
+		return err
+	}
+
+	uploadFileResponse, err := client.uploadFile(room, fileInfos)
+	if err != nil {
+		return err
+	}
+
+	return client.postFileMessage(room, fileInfos, uploadFileResponse.ContentUri)
+}
+
+func getFileInfos(filePath string) (localFileInfos, error) {
+	filePath = os.Getenv(DISCORD_BACKUP_DIR) + "/" + filePath
+	localFileInfos := localFileInfos{}
+
+	fileInfos, err := os.Stat(filePath)
+	if err != nil {
+		return localFileInfos, err
+	}
+
+	localFileInfos.FileName = fileInfos.Name()
+	localFileInfos.Size = fileInfos.Size()
+	localFileInfos.FilePath = filePath
+	mtype, err := mimetype.DetectFile(filePath)
+
+	if err != nil {
+		return localFileInfos, err
+	}
+
+	localFileInfos.Mimetype = mtype.String()
+
+	return localFileInfos, nil
+}
+
+func (c *apiClient) uploadFile(room roomStructure, fileInfos localFileInfos) (*uploadFileResponse, error) {
+	logger.Info("Uploading file " + fileInfos.FilePath)
+
+	payload, err := os.Open(fileInfos.FilePath)
+
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s%s", c.BaseURL, "/_matrix/media/v3/upload?filename"+fileInfos.FileName), payload)
+
+	if err != nil {
+		logger.Error(err.Error())
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", fileInfos.Mimetype)
+	req.Header.Add("Authorization", "Bearer "+c.Token)
+
+	res, err := c.HTTPClient.Do(req)
+	if err != nil {
+		logger.Error(err.Error())
+		return nil, err
+	}
+
+	defer res.Body.Close()
+
+	uploadFileResponse := uploadFileResponse{}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		logger.Error(err.Error())
+		return nil, err
+	}
+
+	if err = json.Unmarshal(body, &uploadFileResponse); err != nil {
+		logger.Error(err.Error())
+		return nil, err
+	}
+
+	logger.Info("Upload sucessful")
+
+	return &uploadFileResponse, nil
 
 }
 
-func postStickerMessage() {
-	getFileInfos()
-	uploadFile()
-	postFileMessage()
-}
+func (c *apiClient) postFileMessage(room roomStructure, localFileInfos localFileInfos, contentUri string) (err error) {
+	logger.Info("Posting file message")
 
-func postAttachmentMessage() {
-	getFileInfos()
-	uploadFile()
-	postFileMessage()
-}
+	msgType := "m.file"
 
-func getFileInfos() {
+	if strings.Contains(localFileInfos.Mimetype, "image") {
+		msgType = "m.image"
+	}
+	if strings.Contains(localFileInfos.Mimetype, "audio") {
+		msgType = "m.audio"
+	}
+	if strings.Contains(localFileInfos.Mimetype, "video") {
+		msgType = "m.video"
+	}
 
-}
+	payload := fileMessagePayload{
+		Body:        localFileInfos.FileName,
+		Url:         contentUri,
+		MessageType: msgType,
+		Info: fileInfos{
+			Mimetype: localFileInfos.Mimetype,
+			Size:     localFileInfos.Size,
+		},
+	}
 
-func uploadFile() {
+	jsonData, err := json.Marshal(payload)
+	url := fmt.Sprintf("%s%s%s%s", c.BaseURL, "/_matrix/client/v3/rooms/", url.QueryEscape(room.RoomId), "/state/m.room.message")
 
-}
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewBuffer(jsonData))
 
-func postFileMessage() {
+	if err != nil {
+		logger.Error(err.Error())
+		return
+	}
 
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Authorization", "Bearer "+c.Token)
+
+	res, err := c.HTTPClient.Do(req)
+	if err != nil {
+		logger.Error(err.Error())
+		return
+	}
+
+	defer res.Body.Close()
+
+	uploadFileResponse := uploadFileResponse{}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		logger.Error(err.Error())
+		return
+	}
+
+	if err = json.Unmarshal(body, &uploadFileResponse); err != nil {
+		logger.Error(err.Error())
+		return
+	}
+
+	logger.Info("File message posted sucessfully")
+
+	return
 }
