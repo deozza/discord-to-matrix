@@ -41,6 +41,16 @@ cd discord-to-matrix
 docker run --rm -v ./discord:/out tyrrrz/discordchatexporter:stable exportguild -t <token_discord> -f json -g <id_guilde> --parallel <number_of_chans_to_process_in_parallels> --media true --reuse-media true --include-vc false --after <date_min_messages>
 ```
 
+- copy the `.env.dist` file into a `.env` file and fill the following infos:
+
+| Variable              | Description                                                                                | Required ?                                                 |
+|-----------------------|--------------------------------------------------------------------------------------------|------------------------------------------------------------|
+| DISCORD_BACKUP_DIR    | Path to the folder containing the discord backup files. By default it is `/go/src/discord` | YES                                                        |
+| MATRIX_SERVER_ADDRESS | URL to the targeted Matrix server                                                          | YES                                                        |
+| MATRIX_USERNAME       | Username of a valid Matrix account on the previously provided server                       | NO (if `MATRIX_TOKEN` is filled)                           |
+| MATRIX_PASSWORD       | Password of a valid Matrix account on the previously provided server                       | NO (if `MATRIX_TOKEN` is filled)                           |
+| MATRIX_TOKEN          | Token of a valid session on the previously provided server                                 | NO (if `MATRIX_USERNAME` and `MATRIX_PASSWORD` are filled) |
+
 - build the env and install the dependencies
 
 ```bash
